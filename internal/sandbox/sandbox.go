@@ -146,24 +146,24 @@ func RunChild(logger *slog.Logger) {
 }
 
 func runChild(log *slog.Logger) Result {
-	var env Envelope
-	if err := json.NewDecoder(os.Stdin).Decode(&env); err != nil {
+	var enve Envelope
+	if err := json.NewDecoder(os.Stdin).Decode(&enve); err != nil {
 		log.Error("decode envelope", "err", err)
 		return Result{Error: "decode envelope: " + err.Error()}
 	}
 	log.Debug("envelope received",
-		"tool", env.Tool,
-		"allowed_ro", env.AllowedRO,
-		"allowed_rw", env.AllowedRW)
+		"tool", enve.Tool,
+		"allowed_ro", enve.AllowedRO,
+		"allowed_rw", enve.AllowedRW)
 
 	registry := map[string]tools.Tool{}
 	for _, t := range tools.Default() {
 		registry[t.Spec.Function.Name] = t
 	}
-	tool, ok := registry[env.Tool]
+	tool, ok := registry[enve.Tool]
 	if !ok {
-		log.Error("unknown tool", "tool", env.Tool)
-		return Result{Error: "unknown tool: " + env.Tool}
+		log.Error("unknown tool", "tool", enve.Tool)
+		return Result{Error: "unknown tool: " + enve.Tool}
 	}
 
 	// Apply Landlock. We accept paths that may not exist (IgnoreIfMissing)
@@ -176,12 +176,12 @@ func runChild(log *slog.Logger) Result {
 	// the time they reach us they've been stat-verified by the parent and
 	// further pruned by splitDirsFiles, so anything reaching Landlock is
 	// known to exist.
-	roDirs, roFiles := splitDirsFiles(env.AllowedRO)
-	rwDirs, rwFiles := splitDirsFiles(env.AllowedRW)
 	rules := []landlock.Rule{
 		landlock.RODirs(BaselineRO...).IgnoreIfMissing(),
 		landlock.RWFiles(BaselineRWFiles...).IgnoreIfMissing(),
 	}
+	roDirs, roFiles := splitDirsFiles(enve.AllowedRO)
+	rwDirs, rwFiles := splitDirsFiles(enve.AllowedRW)
 	if len(roDirs) > 0 {
 		rules = append(rules, landlock.RODirs(roDirs...))
 	}
@@ -204,11 +204,11 @@ func runChild(log *slog.Logger) Result {
 		"ro_dirs", roDirs, "ro_files", roFiles,
 		"rw_dirs", rwDirs, "rw_files", rwFiles)
 
-	output, err := tool.Handler(env.Args)
-	defaultMode := defaultModeFor(env.Tool)
+	output, err := tool.Handler(enve.Args)
+	defaultMode := defaultModeFor(enve.Tool)
 
 	if err != nil {
-		log.Debug("tool returned error", "tool", env.Tool, "err", err.Error())
+		log.Debug("tool returned error", "tool", enve.Tool, "err", err.Error())
 		if path := pathFromError(err); path != "" {
 			mode := modeFromOp(err, defaultMode)
 			log.Info("EACCES detected via PathError",
@@ -232,7 +232,7 @@ func runChild(log *slog.Logger) Result {
 		}
 	}
 
-	log.Debug("tool succeeded", "tool", env.Tool, "output_bytes", len(output))
+	log.Debug("tool succeeded", "tool", enve.Tool, "output_bytes", len(output))
 	return Result{Output: output}
 }
 
