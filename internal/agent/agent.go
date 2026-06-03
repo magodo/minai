@@ -128,12 +128,6 @@ func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
 	fmt.Fprintf(a.out, "\n\x1b[2m→ %s(%s)\x1b[0m\n", tc.Function.Name, compactJSON(tc.Function.Arguments))
 	a.log.Info("tool call", "tool", tc.Function.Name, "args", compactJSON(tc.Function.Arguments))
 
-	if tc.Function.Name == "run_shell" && !a.confirm("  allow shell command? [y/N]: ") {
-		fmt.Fprintln(a.out, "\x1b[2m← denied\x1b[0m")
-		a.log.Info("run_shell denied by user")
-		return "user denied execution"
-	}
-
 	for attempt := 0; attempt < maxPermissionRetries; attempt++ {
 		ro, rw := a.access.snapshot()
 		env := sandbox.Envelope{

@@ -30,7 +30,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 
@@ -205,7 +204,7 @@ func runChild(log *slog.Logger) Result {
 		"rw_dirs", rwDirs, "rw_files", rwFiles)
 
 	output, err := tool.Handler(enve.Args)
-	defaultMode := defaultModeFor(enve.Tool)
+	defaultMode := "ro"
 
 	if err != nil {
 		log.Debug("tool returned error", "tool", enve.Tool, "err", err.Error())
@@ -223,8 +222,8 @@ func runChild(log *slog.Logger) Result {
 	}
 
 	if path := pathFromText(output); path != "" {
-		log.Info("EACCES detected via stderr regex",
-			"path", path, "mode", defaultMode)
+		log.Info("EACCES detected via output(stdout+stderr) regex",
+			"path", path, "mode", defaultMode, "output", output)
 		return Result{
 			Output:     output,
 			DeniedPath: canonical(path),
@@ -236,45 +235,13 @@ func runChild(log *slog.Logger) Result {
 	return Result{Output: output}
 }
 
-func defaultModeFor(tool string) string {
-	switch tool {
-	case "read_file", "list_dir":
-		return "ro"
-	default:
-		return "rw"
-	}
-}
-
-// pathFromError unwraps fs.PathError chains looking for an EACCES denial and
-// returns the offending path.
+// pathFromError searches err's tree for an fs.PathError carrying a permission
+// denial and returns the offending path.
 func pathFromError(err error) string {
-	for e := err; e != nil; {
-		if pe, ok := errors.AsType[*fs.PathError](e); ok {
-			if isPermission(pe.Err) {
-				return pe.Path
-			}
-		}
-		u := errors.Unwrap(e)
-		if u == nil {
-			break
-		}
-		e = u
-	}
-	if isPermission(err) {
-		// Fallback: error reports permission but not via PathError.
-		return ""
+	if pe, ok := errors.AsType[*fs.PathError](err); ok && os.IsPermission(pe.Err) {
+		return pe.Path
 	}
 	return ""
-}
-
-func isPermission(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
-		return true
-	}
-	return os.IsPermission(err)
 }
 
 // modeFromOp inspects fs.PathError.Op to decide whether the access attempt
