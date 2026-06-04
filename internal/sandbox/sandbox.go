@@ -130,6 +130,13 @@ func debugEnabled() bool {
 	return v != "" && v != "0"
 }
 
+// auditEnabled reports whether the user asked for Landlock kernel audit
+// logging (via -l on the parent, propagated as MINAI_AUDIT=1).
+func auditEnabled() bool {
+	v := os.Getenv("MINAI_AUDIT")
+	return v != "" && v != "0"
+}
+
 // RunChild is the entry point of the sandboxed subprocess. It reads an
 // Envelope from stdin, applies Landlock, runs the tool, and writes the
 // resulting JSON to stdout. It always exits the process (success or not).
@@ -193,7 +200,14 @@ func runChild(log *slog.Logger) Result {
 	if len(rwFiles) > 0 {
 		rules = append(rules, landlock.RWFiles(rwFiles...))
 	}
-	if err := landlock.V8.BestEffort().RestrictPaths(rules...); err != nil {
+	cfg := landlock.V8.BestEffort()
+	if auditEnabled() {
+		// Library default already logs denials for the originating process on
+		// ABI v7+; opt in subprocesses too so a shelled-out child also shows
+		// up in the kernel audit stream.
+		cfg = cfg.EnableLoggingForSubprocesses()
+	}
+	if err := cfg.RestrictPaths(rules...); err != nil {
 		log.Error("apply landlock failed", "err", err)
 		return Result{Error: "apply landlock: " + err.Error()}
 	}
@@ -201,7 +215,8 @@ func runChild(log *slog.Logger) Result {
 		"baseline_ro", BaselineRO,
 		"baseline_rw_files", BaselineRWFiles,
 		"ro_dirs", roDirs, "ro_files", roFiles,
-		"rw_dirs", rwDirs, "rw_files", rwFiles)
+		"rw_dirs", rwDirs, "rw_files", rwFiles,
+		"audit", auditEnabled())
 
 	output, err := tool.Handler(enve.Args)
 	defaultMode := "ro"

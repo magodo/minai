@@ -7,6 +7,7 @@
 //	minai -p "your prompt"      # one-shot: run a single turn and exit
 //	echo "prompt" | minai -p -  # one-shot: read prompt from stdin
 //	minai -debug                # verbose slog output on stderr
+//	minai -l                    # enable Landlock kernel audit log for denials
 //
 // Environment:
 //
@@ -16,6 +17,10 @@
 //	MINAI_YES                   # if set, auto-approve run_shell (use with care)
 //	MINAI_DEBUG                 # if set (and not "0"), same as -debug; also
 //	                            # inherited by the sandboxed child process
+//	MINAI_AUDIT                 # if set (and not "0"), same as -l; inherited
+//	                            # by the sandboxed child so it leaves Landlock
+//	                            # kernel audit logging at its default (on for
+//	                            # the originating process on ABI v7+).
 package main
 
 import (
@@ -73,18 +78,23 @@ func run() error {
 	var (
 		prompt string
 		debug  bool
+		audit  bool
 	)
 	flag.StringVar(&prompt, "p", "", "one-shot prompt; use '-' to read from stdin")
 	flag.BoolVar(&debug, "debug", false, "enable debug logging on stderr (also via MINAI_DEBUG=1)")
+	flag.BoolVar(&audit, "l", false, "enable Landlock kernel audit log for sandbox denials (also via MINAI_AUDIT=1)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [-debug] [-p PROMPT|-]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s [-debug] [-l] [-p PROMPT|-]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	// Promote the flag into the env var so the sandboxed child inherits it.
+	// Promote the flags into env vars so the sandboxed child inherits them.
 	if debug {
 		os.Setenv("MINAI_DEBUG", "1")
+	}
+	if audit {
+		os.Setenv("MINAI_AUDIT", "1")
 	}
 	logger := newLogger(debugEnabled(), "agent")
 
