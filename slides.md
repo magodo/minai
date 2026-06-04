@@ -145,10 +145,10 @@ layoutClass: gap-8
 
 **Costs**
 
-- Requires unprivileged user namespaces (disabled on some distros / Ubuntu's AppArmor profile, kernel hardening)
-- Each tool call rebuilds a namespace — non-trivial setup cost
-- The mount view can confuse tools that follow symlinks or read `/proc/self/mountinfo`
-- Hard to grant a *new* path mid-session without tearing down the namespace
+- Needs unprivileged user namespaces (off on some distros)
+- Per-call namespace setup is non-trivial
+- Mount view can confuse symlink-following tools
+- Granting a new path mid-session means tearing down the namespace
 
 </div>
 
@@ -167,7 +167,7 @@ layoutClass: gap-8
 
 ```text
                  ┌──────────────────────────┐
-   parent ──fork┤  child: applies Landlock  │── exec tool ──► restricted view of FS
+   parent ──fork ┤  child: applies Landlock │── exec tool ──► restricted view of FS
                  └──────────────────────────┘
 ```
 
@@ -194,16 +194,8 @@ For a **local** AI agent this is almost ideal:
 | Works on real files| no (copy / mount) | yes (bind mount) | **yes (direct)** |
 | Requires root / caps | sometimes | sometimes (userns) | **no** |
 | Per-call scoping   | awkward | possible | **natural** |
-| Network isolation  | yes | yes | **no** (out of scope) |
+| Network isolation  | yes | yes | **partial** (TCP bind/connect, Linux ≥ 6.7) |
 | Kernel support     | universal | universal | Linux ≥ 5.13 |
-
-<v-click>
-
-Landlock is **not** the right tool for hostile multi-tenant code execution —
-that's still a VM job. It's the right tool for **"my agent should not be able
-to `cat ~/.ssh/id_rsa` unless I say so."**
-
-</v-click>
 
 ---
 
@@ -264,7 +256,7 @@ tool call just returned `EACCES`.
 
 This turns permission management into a **conversation**, not a config file:
 
-- No allowlist to maintain by hand
+- No allowlist required up-front (a persistent one is still useful — see roadmap)
 - The user sees *exactly* which path is needed and *why* (which tool / which call)
 - Approvals accumulate per session — the second `read_file` on the same dir is silent
 
@@ -275,23 +267,22 @@ This turns permission management into a **conversation**, not a config file:
 # How minai does it — architecture
 
 ```text
-┌──────────── parent (agent) ────────────┐
-│  REPL  ─▶  ReAct loop                  │
-│            │                           │
-│            ▼                           │
-│   Copilot Chat API ──tool_calls──┐     │
-│            ▲                     │     │
-│            │                     ▼     │
-│       AccessStore        sandbox.Exec  │
-│      (ro/rw paths)         (fork+exec) │
-└────────────────────────────────┬───────┘
-                                 │ JSON envelope on stdin
-                       ┌─────────▼──────────┐
-                       │  child (re-exec)   │
-                       │  • apply Landlock  │
-                       │  • run tool        │
-                       │  • JSON result     │
-                       └────────────────────┘
+┌─────────── parent (agent) ────────────┐
+│  REPL ─▶ ReAct loop                   │
+│            │                          │
+│            ▼                          │
+│   Copilot Chat API ──tool_calls──┐    │
+│                                  ▼    │
+│   AccessStore ──ro,rw──▶ sandbox.Exec │
+│   (ro/rw paths)        (fork+exec)    │
+└──────────────────────────────┬────────┘
+                               │ JSON envelope (tool,args,ro,rw)
+                     ┌─────────▼────────┐
+                     │ child (re-exec)  │
+                     │ • apply Landlock │
+                     │ • run tool       │
+                     │ • JSON result    │
+                     └──────────────────┘
 ```
 
 - One **re-exec'd subprocess per tool call** — Landlock is irrevocable, so each call gets a fresh slate
@@ -302,28 +293,25 @@ This turns permission management into a **conversation**, not a config file:
 
 # Inside the child: applying Landlock
 
+The child does the same three steps for every tool call:
+
 ```go
+// 1. Build the ruleset: baseline + caller-approved paths
 rules := []landlock.Rule{
     landlock.RODirs(BaselineRO...).IgnoreIfMissing(),
     landlock.RWFiles(BaselineRWFiles...).IgnoreIfMissing(),
-}
-roDirs, roFiles := splitDirsFiles(env.AllowedRO)
-rwDirs, rwFiles := splitDirsFiles(env.AllowedRW)
-rules = append(rules,
-    landlock.RODirs(roDirs...), landlock.ROFiles(roFiles...),
-    landlock.RWDirs(rwDirs...), landlock.RWFiles(rwFiles...),
-)
-
-if err := landlock.V8.BestEffort().RestrictPaths(rules...); err != nil {
-    return Result{Error: "apply landlock: " + err.Error()}
+    // ... + env.AllowedRO / env.AllowedRW from the envelope
 }
 
-output, err := tool.Handler(env.Args)   // ← runs *under* the restriction
+// 2. Self-restrict — irrevocable for the rest of this process
+landlock.V8.BestEffort().RestrictPaths(rules...)
+
+// 3. Run the tool *under* the restriction
+output, err := tool.Handler(env.Args)
 ```
 
-- `BestEffort()` degrades cleanly on kernels without Landlock v8
-- `IgnoreIfMissing()` on the baseline absorbs distro differences (`/lib64` etc.)
-- Caller-approved paths are stat-verified before reaching here
+The order matters: **restrict first, then run**. Anything the tool touches
+after step 2 is filtered by the kernel.
 
 ---
 
