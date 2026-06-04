@@ -230,6 +230,12 @@ func (a *Agent) promptAccess(path, suggested string) (string, string) {
 				"        is %s access on its nearest existing ancestor: %s\x1b[0m\n",
 			path, def, grantPath)
 	}
+	if fi, err := os.Stat(grantPath); err == nil && fi.IsDir() {
+		fmt.Fprintf(a.out,
+			"\x1b[33m  note: %s is a directory; the grant applies recursively\n"+
+				"        to all files and subdirectories beneath it\x1b[0m\n",
+			grantPath)
+	}
 	fmt.Fprintf(a.out, "  allow %s? [r=read-only / w=read-write / n=deny] (default %s): ", grantPath, def)
 	line, err := a.in.ReadString('\n')
 	if err != nil {
