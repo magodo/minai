@@ -334,14 +334,8 @@ if path := pathFromText(output); path != "" {
 
 <v-click>
 
-The parent then prompts:
-
-```text
-  sandbox blocked ro access to /home/me/project/README.md
-  allow /home/me/project/README.md? [r=read-only / w=read-write / n=deny] (default ro):
-```
-
-…and retries the same tool call with the approval added to `AccessStore`.
+The parent then prompts the user (`allow ... ? [r/w/n]`), records the
+approval in `AccessStore`, and retries the same tool call.
 
 </v-click>
 
@@ -353,17 +347,8 @@ What if the model wants to `write_file("/home/me/new-dir/out.txt")` and
 `new-dir` doesn't exist yet?
 
 - Landlock can't grant access to a path that doesn't exist
-- The minimum workable grant is the nearest existing ancestor
-
-```go
-func resolveGrantTarget(p string) (target string, widened bool) {
-    if _, err := os.Stat(p); err == nil { return p, false }
-    for cur := filepath.Dir(p); cur != "/" && cur != "."; cur = filepath.Dir(cur) {
-        if _, err := os.Stat(cur); err == nil { return cur, true }
-    }
-    return "/", true
-}
-```
+- The minimum workable grant is the **nearest existing ancestor** — walk
+  upward from the requested path until `stat` succeeds
 
 …and we **surface that to the user** rather than silently widening scope:
 
@@ -374,30 +359,15 @@ func resolveGrantTarget(p string) (target string, widened bool) {
 ```
 
 ---
+layout: center
+class: text-center
+---
 
-# A session, end-to-end
+# Demo
 
-```text
-> summarize the README
-
-→ read_file({"path":"README.md"})
-  sandbox blocked ro access to /home/me/proj/README.md
-  allow /home/me/proj/README.md? [r/w/n] (default ro): ⏎
-← # minai — a minimal AI agent ...
-
-→ list_dir({"path":"internal"})
-  sandbox blocked ro access to /home/me/proj/internal
-  allow /home/me/proj/internal? [r/w/n] (default ro): r
-← agent/  copilot/  sandbox/  tools/
-
-→ read_file({"path":"internal/sandbox/sandbox.go"})
-← // Package sandbox runs a single tool invocation ...
-
-The README describes minai as ...
-```
-
-- Two prompts, then silence — the rest is covered by the dir grant
-- No global allowlist, no `--bind` flags, no container to rebuild
+<div class="pt-8 text-[12rem] opacity-80">
+  <carbon:terminal />
+</div>
 
 ---
 
@@ -457,15 +427,19 @@ explaining to the user *what the agent actually did*.
 
 # Roadmap
 
-- [x] Per-tool-call Landlock sandbox via re-exec
-- [x] Interactive, incremental path approvals (`ro` / `rw`)
-- [x] Nearest-existing-ancestor resolution for write targets
-- [x] Structured + regex-based denial detection
-- [ ] **ptrace-based denial detection** — distinguish Landlock from real `EACCES`
-- [ ] Persistent per-project approval cache (`.minai/allow.json`)
-- [ ] Landlock **network rules** (Linux 6.7+: `TCP bind/connect`)
-- [ ] Per-tool baseline tightening (e.g. `read_file` doesn't need `/dev/tty`)
-- [ ] MCP tool support, with the same sandbox model
+**Done**
+
+- Per-tool-call Landlock sandbox via re-exec
+- Interactive, incremental path approvals (`ro` / `rw`)
+- Structured + regex-based denial detection
+
+**Next**
+
+- **ptrace-based denial detection** — distinguish Landlock from real `EACCES`
+- Persistent per-project approval cache (`.minai/allow.json`)
+- Landlock **network rules** (Linux 6.7+: `TCP bind/connect`)
+- Per-tool baseline tightening (e.g. `read_file` doesn't need `/dev/tty`)
+- MCP tool support, with the same sandbox model
 
 ---
 layout: center
@@ -482,10 +456,9 @@ class: text-center
 - Bubblewrap is great but assumes mount-namespace gymnastics
 - **Landlock** gives you cheap, per-call, path-scoped restrictions with zero root
 - The agent *asks* for access as it discovers it needs it — trust is incremental
-- **minai** is a ~600-LoC reference implementation of this pattern
 
 </div>
 
 <div class="pt-12 opacity-70">
-  github.com/magodo/minai
+  <a href="https://github.com/magodo/minai" target="_blank">github.com/magodo/minai</a>
 </div>
