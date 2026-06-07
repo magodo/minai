@@ -15,6 +15,12 @@
 // EACCES on a path that hasn't been pre-approved, the agent prompts the user
 // to allow read-only or read-write access. Approvals live in an in-memory
 // AccessStore for the rest of the session and are re-applied on retry.
+//
+// Per-call configuration: each Envelope carries a DetectMode which selects
+// the access-failure detection strategy the run_shell tool uses (regex over
+// stdout/stderr vs. ptrace-based syscall interception). The active mode is
+// owned by the Agent and switched at runtime via SetDetectMode (driven by
+// the /detect REPL command).
 package agent
 
 import (
@@ -56,7 +62,19 @@ type Agent struct {
 	log      *slog.Logger
 
 	access *accessStore
+
+	// detectMode names the access-failure detection strategy used for
+	// the run_shell tool. It is mutable at runtime via SetDetectMode
+	// (driven by the /detect REPL command). Other tools ignore it.
+	mu         sync.Mutex
+	detectMode string
 }
+
+// Supported values for Agent.detectMode and Envelope.DetectMode.
+const (
+	DetectModeDefault = "default"
+	DetectModePtrace  = "ptrace"
+)
 
 // New builds an Agent. The reader is used only for tool-confirmation prompts;
 // the caller should pass the same *bufio.Reader it uses for its own input loop
@@ -73,15 +91,40 @@ func New(c *copilot.Client, ts []tools.Tool, out io.Writer, in *bufio.Reader, lo
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Agent{
-		client:   c,
-		tools:    m,
-		specs:    specs,
-		history:  []copilot.Message{{Role: "system", Content: SystemPrompt}},
-		out:      out,
-		in:       in,
-		maxSteps: 20,
-		log:      logger,
-		access:   newAccessStore(),
+		client:     c,
+		tools:      m,
+		specs:      specs,
+		history:    []copilot.Message{{Role: "system", Content: SystemPrompt}},
+		out:        out,
+		in:         in,
+		maxSteps:   20,
+		log:        logger,
+		access:     newAccessStore(),
+		detectMode: DetectModeDefault,
+	}
+}
+
+// DetectMode returns the active access-failure detection mode for the
+// run_shell tool. The default for a fresh Agent is DetectModeDefault.
+func (a *Agent) DetectMode() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.detectMode
+}
+
+// SetDetectMode switches the access-failure detection mode used for the
+// run_shell tool. It returns an error for unknown values so callers (e.g.
+// the REPL's /detect command) can surface a useful message.
+func (a *Agent) SetDetectMode(mode string) error {
+	switch mode {
+	case DetectModeDefault, DetectModePtrace:
+		a.mu.Lock()
+		a.detectMode = mode
+		a.mu.Unlock()
+		return nil
+	default:
+		return fmt.Errorf("unknown detect mode %q (want %q or %q)",
+			mode, DetectModeDefault, DetectModePtrace)
 	}
 }
 
@@ -130,15 +173,18 @@ func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
 
 	for attempt := 0; attempt < maxPermissionRetries; attempt++ {
 		ro, rw := a.access.snapshot()
+		detectMode := a.DetectMode()
 		env := sandbox.Envelope{
-			Tool:      tc.Function.Name,
-			Args:      json.RawMessage(tc.Function.Arguments),
-			AllowedRO: ro,
-			AllowedRW: rw,
+			Tool:       tc.Function.Name,
+			Args:       json.RawMessage(tc.Function.Arguments),
+			AllowedRO:  ro,
+			AllowedRW:  rw,
+			DetectMode: detectMode,
 		}
 		a.log.Debug("sandbox exec",
 			"attempt", attempt+1,
 			"tool", tc.Function.Name,
+			"detect_mode", detectMode,
 			"allowed_ro", ro,
 			"allowed_rw", rw)
 		res, err := sandbox.Exec(ctx, env, a.log)

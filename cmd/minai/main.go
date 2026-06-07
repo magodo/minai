@@ -9,6 +9,19 @@
 //	minai -debug                # verbose slog output on stderr
 //	minai -l                    # enable Landlock kernel audit log for denials
 //
+// REPL commands:
+//
+//	/help                       list available commands
+//	/quit, /exit                exit
+//	/detect                     show the current access-failure detection
+//	                            mode used by the run_shell tool
+//	/detect default | ptrace    switch the detection mode at runtime.
+//	                            "default" matches the historical regex
+//	                            over the command's combined output;
+//	                            "ptrace" intercepts FS syscalls (linux/amd64
+//	                            kernel >=5.3) and reports EACCES/EPERM at
+//	                            their source, including the exact path.
+//
 // Environment:
 //
 //	MINAI_MODEL                 # override default model (gpt-4o)
@@ -134,7 +147,7 @@ func run() error {
 	}
 
 	// Interactive REPL.
-	fmt.Printf("minai (model=%s) — type /quit to exit\n", model)
+	fmt.Printf("minai (model=%s) — type /help for commands, /quit to exit\n", model)
 	for {
 		fmt.Print("\n> ")
 		line, err := stdin.ReadString('\n')
@@ -146,14 +159,53 @@ func run() error {
 			return err
 		}
 		line = strings.TrimSpace(line)
-		switch line {
-		case "":
+		if line == "" {
 			continue
-		case "/quit", "/exit":
-			return nil
+		}
+		if strings.HasPrefix(line, "/") {
+			done, err := dispatchSlash(line, ag, os.Stdout)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "minai:", err)
+			}
+			if done {
+				return nil
+			}
+			continue
 		}
 		if err := ag.Turn(ctx, line); err != nil {
 			fmt.Fprintln(os.Stderr, "turn error:", err)
 		}
+	}
+}
+
+// dispatchSlash handles the REPL's slash commands. It returns done=true
+// when the caller should exit the REPL loop (e.g. /quit), and an error
+// for diagnostics that should be printed to stderr but do not terminate
+// the session.
+func dispatchSlash(line string, ag *agent.Agent, out io.Writer) (done bool, err error) {
+	cmd, arg, _ := strings.Cut(line, " ")
+	arg = strings.TrimSpace(arg)
+	switch cmd {
+	case "/quit", "/exit":
+		return true, nil
+	case "/help":
+		fmt.Fprintln(out, "commands:")
+		fmt.Fprintln(out, "  /help                       show this list")
+		fmt.Fprintln(out, "  /quit, /exit                exit the REPL")
+		fmt.Fprintln(out, "  /detect                     show the current shell access-failure detection mode")
+		fmt.Fprintln(out, "  /detect default | ptrace    switch detection mode for the run_shell tool")
+		return false, nil
+	case "/detect":
+		if arg == "" {
+			fmt.Fprintf(out, "detect mode: %s\n", ag.DetectMode())
+			return false, nil
+		}
+		if err := ag.SetDetectMode(arg); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(out, "detect mode: %s\n", ag.DetectMode())
+		return false, nil
+	default:
+		return false, fmt.Errorf("unknown command %q (try /help)", cmd)
 	}
 }

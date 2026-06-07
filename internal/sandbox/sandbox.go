@@ -3,14 +3,25 @@
 //
 // The main agent re-execs itself ("/proc/self/exe") with the environment
 // variable MINAI_TOOL_EXEC=1 set. The child reads a JSON Envelope from stdin
-// describing which tool to run, the JSON args to pass, and the lists of
-// filesystem paths it is allowed to access (read-only and read-write). The
-// child applies Landlock to itself with a small baseline of system RO paths
-// plus the caller-provided allow lists, then executes the tool handler and
-// writes a JSON Result to stdout.
+// describing which tool to run, the JSON args to pass, the lists of
+// filesystem paths it is allowed to access (read-only and read-write), and
+// the per-call access-failure detection mode. The child applies Landlock to
+// itself with a small baseline of system RO paths plus the caller-provided
+// allow lists, then executes the tool handler and writes a JSON Result to
+// stdout.
 //
 // On EACCES the Result includes the offending path and the desired mode
-// ("ro"/"rw") so the parent can prompt the user and retry.
+// ("ro"/"rw") so the parent can prompt the user and retry. Two detection
+// strategies are wired in:
+//
+//   - A Go-error route (`pathFromError`) that unwraps `*fs.PathError` from
+//     handlers that return an error containing one. This works for both
+//     direct Go syscall wrappers (read_file, write_file, ...) and for the
+//     run_shell tool when it runs under the "ptrace" detect mode and
+//     synthesizes a PathError from a ptrace-observed EACCES/EPERM syscall.
+//   - A combined-output regex route (`pathFromText`) that matches typical
+//     coreutils / shell "Permission denied" lines. This is the fallback
+//     for run_shell in its default detect mode.
 //
 // Landlock self-restriction is irrevocable for the calling process, which is
 // why every tool call uses a fresh subprocess.
@@ -37,12 +48,24 @@ import (
 )
 
 // Envelope is what the parent writes to the child's stdin.
+//
+// DetectMode is the per-call name of the access-failure detection strategy
+// a tool should use. It is currently only consulted by the run_shell tool,
+// which supports "default" (regex over the command's combined output) and
+// "ptrace" (syscall-level interception via the ptrace package). The empty
+// string is treated as "default". Tools that don't care simply ignore it.
 type Envelope struct {
-	Tool      string          `json:"tool"`
-	Args      json.RawMessage `json:"args"`
-	AllowedRO []string        `json:"allowed_ro"`
-	AllowedRW []string        `json:"allowed_rw"`
+	Tool       string          `json:"tool"`
+	Args       json.RawMessage `json:"args"`
+	AllowedRO  []string        `json:"allowed_ro"`
+	AllowedRW  []string        `json:"allowed_rw"`
+	DetectMode string          `json:"detect_mode,omitempty"`
 }
+
+// EnvDetectMode is the name of the environment variable the sandboxed
+// child sets on itself, before invoking the tool handler, to communicate
+// Envelope.DetectMode without changing the Handler signature.
+const EnvDetectMode = "MINAI_DETECT_MODE"
 
 // Result is what the child writes to its stdout.
 type Result struct {
@@ -218,16 +241,32 @@ func runChild(log *slog.Logger) Result {
 		"rw_dirs", rwDirs, "rw_files", rwFiles,
 		"audit", auditEnabled())
 
+	// Expose the per-call detect mode to the tool handler via env var so
+	// the Handler signature can stay free of plumbing. Cleared again
+	// after the call to avoid leaking into anything that re-reads
+	// os.Environ later in the same process (the child exits immediately
+	// after, so this is belt-and-suspenders).
+	if enve.DetectMode != "" {
+		os.Setenv(EnvDetectMode, enve.DetectMode)
+		defer os.Unsetenv(EnvDetectMode)
+	}
+
 	output, err := tool.Handler(enve.Args)
 	defaultMode := "ro"
 
 	if err != nil {
-		log.Debug("tool returned error", "tool", enve.Tool, "err", err.Error())
+		log.Debug("tool returned error", "tool", enve.Tool, "err", err.Error(), "output", output)
 		if path := pathFromError(err); path != "" {
 			mode := modeFromOp(err, defaultMode)
 			log.Info("EACCES detected via PathError",
 				"path", path, "mode", mode, "err", err)
+			// Output is kept too: the Go-native tools always return
+			// "" on error so this is a no-op for them, but the
+			// run_shell tool's ptrace-mode handler returns the
+			// command's combined output alongside a synthesized
+			// PathError and we don't want to drop it.
 			return Result{
+				Output:     output,
 				Error:      err.Error(),
 				DeniedPath: canonical(path),
 				DeniedMode: mode,
