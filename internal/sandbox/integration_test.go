@@ -73,6 +73,11 @@ func TestExec_ShellPtrace_EACCES(t *testing.T) {
 // pre-grant the dir via AllowedRO so Landlock doesn't deny first, then
 // run a shell command that touches both files. The POSIX layer rejects
 // each open() with EACCES and both paths should show up in res.Denials.
+//
+// The command intentionally ends on the second cat (no `echo done` or
+// other success-tail) so the shell's overall exit status is non-zero;
+// runShellPtrace suppresses denials on a clean exit since they would
+// then be tolerated probes rather than actual access failures.
 func TestExec_ShellPtrace_MultipleDenials(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root; chmod 0000 has no effect")
@@ -91,7 +96,7 @@ func TestExec_ShellPtrace_MultipleDenials(t *testing.T) {
 	}
 	args, err := json.Marshal(struct {
 		Command string `json:"command"`
-	}{Command: fmt.Sprintf("cat %s 2>&1; cat %s 2>&1; echo done", a, b)})
+	}{Command: fmt.Sprintf("cat %s 2>&1; cat %s 2>&1", a, b)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +186,53 @@ func TestExec_ShellPtrace_ENOENT_NotReported(t *testing.T) {
 	t.Logf("result: %+v", *res)
 	if len(res.Denials) != 0 {
 		t.Errorf("expected no Denials for an ENOENT-only command; got %+v", res.Denials)
+	}
+	if !strings.Contains(res.Output, "ok") {
+		t.Errorf("expected output to contain 'ok'; got %q", res.Output)
+	}
+}
+
+// TestExec_ShellPtrace_SuccessSuppressesDenials verifies that a command
+// which encounters EACCES on a probe but still exits cleanly does not
+// surface any denials. The motivating case: a tool that tries to read
+// an optional dotfile, doesn't find it / can't read it, and proceeds
+// with defaults. We model that with a subshell that swallows the cat
+// failure (`2>/dev/null || true`) and then prints a success marker, so
+// the whole `sh -c` exits 0. The EACCES on the unreadable file is real
+// at the kernel layer (and ptrace captures it), but suppressed at the
+// MultiPathError boundary because the command got what it needed.
+func TestExec_ShellPtrace_SuccessSuppressesDenials(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; chmod 0000 has no effect")
+	}
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "optional.cfg")
+	if err := os.WriteFile(probe, []byte("x"), 0o000); err != nil {
+		t.Fatalf("create %s: %v", probe, err)
+	}
+	if err := os.Chmod(probe, 0o000); err != nil {
+		t.Fatalf("chmod %s: %v", probe, err)
+	}
+	args, err := json.Marshal(struct {
+		Command string `json:"command"`
+	}{Command: fmt.Sprintf("cat %s 2>/dev/null || true; echo ok", probe)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := sandbox.Envelope{
+		Tool:       "run_shell",
+		Args:       args,
+		DetectMode: "ptrace",
+		AllowedRO:  []string{dir},
+	}
+	res, err := sandbox.Exec(context.Background(), env, nil)
+	if err != nil {
+		t.Fatalf("sandbox.Exec: %v", err)
+	}
+	t.Logf("result: %+v", *res)
+	if len(res.Denials) != 0 {
+		t.Errorf("expected no Denials when the command exits 0; got %+v",
+			res.Denials)
 	}
 	if !strings.Contains(res.Output, "ok") {
 		t.Errorf("expected output to contain 'ok'; got %q", res.Output)

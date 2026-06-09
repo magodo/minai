@@ -253,6 +253,14 @@ func (m *MultiPathError) Unwrap() []error {
 // set is returned as a *MultiPathError so the sandbox layer can prompt
 // the user for each denied path in one pass.
 //
+// Denials are only surfaced when the shell exits non-zero. A command that
+// hit EACCES on an optional probe (config files, PATH lookups, recursive
+// walks that gracefully skip unreadable nodes, ...) and still exited 0
+// did not actually need that access, and prompting the user to grant it
+// would be noise. The denials list reflects the failures the user has a
+// reason to care about; the surface here matches what they'd see if they
+// just inspected the command's exit status themselves.
+//
 // Other failed FS syscalls (ENOENT for PATH probing, missing locale
 // catalogs, etc.) are intentionally ignored to stay semantically aligned
 // with the default regex mode, which only matches "Permission denied".
@@ -321,6 +329,14 @@ func runShellPtrace(command string) (string, error) {
 	}
 
 	if len(errs) == 0 {
+		return output, nil
+	}
+	// If the command itself succeeded, the EACCES/EPERM failures we
+	// observed were tolerated by the process (probes, optional config
+	// files, recursive walks that skip unreadable nodes, ...). The
+	// command got what it needed; don't bother the user with grant
+	// prompts for paths whose absence didn't actually break anything.
+	if res.WaitStatus.Exited() && res.WaitStatus.ExitStatus() == 0 {
 		return output, nil
 	}
 	return output, &MultiPathError{Errs: errs}
