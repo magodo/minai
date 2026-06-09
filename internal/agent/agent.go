@@ -37,6 +37,7 @@ import (
 	"sync"
 
 	"minai/internal/copilot"
+	"minai/internal/env"
 	"minai/internal/sandbox"
 	"minai/internal/tools"
 )
@@ -238,7 +239,7 @@ func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
 
 func (a *Agent) confirm(prompt string) bool {
 	// Allow non-interactive auto-approval (handy for one-shot / CI runs).
-	if v := os.Getenv("MINAI_YES"); v != "" && v != "0" {
+	if env.Truthy(env.Yes) {
 		return true
 	}
 	fmt.Fprint(a.out, prompt)
@@ -260,7 +261,7 @@ func (a *Agent) confirm(prompt string) bool {
 func (a *Agent) promptAccess(path, suggested string) (string, string) {
 	grantPath, widened := resolveGrantTarget(path)
 
-	if v := os.Getenv("MINAI_YES"); v != "" && v != "0" {
+	if env.Truthy(env.Yes) {
 		if suggested == "" {
 			suggested = "rw"
 		}

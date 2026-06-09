@@ -50,6 +50,7 @@ import (
 
 	"minai/internal/agent"
 	"minai/internal/copilot"
+	"minai/internal/env"
 	"minai/internal/sandbox"
 	"minai/internal/tools"
 )
@@ -71,8 +72,7 @@ func main() {
 // debugEnabled reports whether MINAI_DEBUG is set to a truthy value. The CLI
 // flag also sets this env var so the value propagates to the sandboxed child.
 func debugEnabled() bool {
-	v := os.Getenv("MINAI_DEBUG")
-	return v != "" && v != "0"
+	return env.Truthy(env.Debug)
 }
 
 // newLogger builds a slog.Logger writing to stderr. When debug is off it
@@ -104,14 +104,14 @@ func run() error {
 
 	// Promote the flags into env vars so the sandboxed child inherits them.
 	if debug {
-		os.Setenv("MINAI_DEBUG", "1")
+		os.Setenv(env.Debug, "1")
 	}
 	if audit {
-		os.Setenv("MINAI_AUDIT", "1")
+		os.Setenv(env.Audit, "1")
 	}
 	logger := newLogger(debugEnabled(), "agent")
 
-	model := os.Getenv("MINAI_MODEL")
+	model := os.Getenv(env.Model)
 	if model == "" {
 		model = "gpt-4o"
 	}

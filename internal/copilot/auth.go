@@ -16,6 +16,8 @@ package copilot
 import (
 	"errors"
 	"os"
+
+	"minai/internal/env"
 )
 
 // APIToken is the credential used as the Bearer for chat completions.
@@ -35,11 +37,11 @@ const defaultEndpoint = "https://api.githubcopilot.com"
 // (optional). It returns an error if the token is missing so configuration
 // problems surface before the first chat call.
 func NewAuth() (*Auth, error) {
-	tok := os.Getenv("MINAI_COPILOT_TOKEN")
+	tok := os.Getenv(env.CopilotToken)
 	if tok == "" {
-		return nil, errors.New("MINAI_COPILOT_TOKEN is not set; export a Copilot API token (Bearer) before running minai")
+		return nil, errors.New(env.CopilotToken + " is not set; export a Copilot API token (Bearer) before running minai")
 	}
-	ep := os.Getenv("MINAI_COPILOT_ENDPOINT")
+	ep := os.Getenv(env.CopilotEndpoint)
 	if ep == "" {
 		ep = defaultEndpoint
 	}

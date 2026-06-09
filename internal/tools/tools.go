@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"minai/internal/copilot"
+	"minai/internal/env"
 	"minai/internal/ptrace"
 )
 
@@ -179,7 +180,7 @@ func runShell() Tool {
 			// sandbox child from Envelope.DetectMode. Empty / unknown
 			// values fall through to the regex-based path, so any
 			// future addition that forgets to set it is harmless.
-			switch os.Getenv("MINAI_DETECT_MODE") {
+			switch os.Getenv(env.DetectMode) {
 			case "ptrace":
 				return runShellPtrace(a.Command)
 			default:

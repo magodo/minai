@@ -44,6 +44,7 @@ import (
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 
+	"minai/internal/env"
 	"minai/internal/tools"
 )
 
@@ -61,11 +62,6 @@ type Envelope struct {
 	AllowedRW  []string        `json:"allowed_rw"`
 	DetectMode string          `json:"detect_mode,omitempty"`
 }
-
-// EnvDetectMode is the name of the environment variable the sandboxed
-// child sets on itself, before invoking the tool handler, to communicate
-// Envelope.DetectMode without changing the Handler signature.
-const EnvDetectMode = "MINAI_DETECT_MODE"
 
 // Result is what the child writes to its stdout.
 type Result struct {
@@ -91,12 +87,10 @@ var BaselineRWFiles = []string{
 	"/dev/random", "/dev/urandom", "/dev/tty",
 }
 
-const envChildMarker = "MINAI_TOOL_EXEC"
-
 // IsChild reports whether the current process was spawned as a sandboxed
 // tool runner. Call this very early in main().
 func IsChild() bool {
-	return os.Getenv(envChildMarker) == "1"
+	return os.Getenv(env.ToolExec) == "1"
 }
 
 // Exec spawns a sandboxed child, runs the named tool, and returns the parsed
@@ -106,7 +100,7 @@ func IsChild() bool {
 // child's stderr is teed through to the parent's os.Stderr so its slog
 // records interleave naturally with the parent's. Otherwise stderr is just
 // captured in case it's needed for an error message.
-func Exec(ctx context.Context, env Envelope, logger *slog.Logger) (*Result, error) {
+func Exec(ctx context.Context, enve Envelope, logger *slog.Logger) (*Result, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -114,13 +108,13 @@ func Exec(ctx context.Context, env Envelope, logger *slog.Logger) (*Result, erro
 	if err != nil {
 		return nil, fmt.Errorf("locate self: %w", err)
 	}
-	payload, err := json.Marshal(env)
+	payload, err := json.Marshal(enve)
 	if err != nil {
 		return nil, fmt.Errorf("marshal envelope: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, self)
-	cmd.Env = append(os.Environ(), envChildMarker+"=1")
+	cmd.Env = append(os.Environ(), env.ToolExec+"=1")
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -132,8 +126,8 @@ func Exec(ctx context.Context, env Envelope, logger *slog.Logger) (*Result, erro
 	}
 
 	logger.Debug("spawn sandbox child",
-		"tool", env.Tool, "exe", self,
-		"allowed_ro", env.AllowedRO, "allowed_rw", env.AllowedRW)
+		"tool", enve.Tool, "exe", self,
+		"allowed_ro", enve.AllowedRO, "allowed_rw", enve.AllowedRW)
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("sandboxed child failed: %w (stderr=%q)", err, stderr.String())
@@ -149,15 +143,13 @@ func Exec(ctx context.Context, env Envelope, logger *slog.Logger) (*Result, erro
 // debugEnabled mirrors the parent CLI flag for the sandbox package without
 // pulling in a cross-package dependency.
 func debugEnabled() bool {
-	v := os.Getenv("MINAI_DEBUG")
-	return v != "" && v != "0"
+	return env.Truthy(env.Debug)
 }
 
 // auditEnabled reports whether the user asked for Landlock kernel audit
 // logging (via -l on the parent, propagated as MINAI_AUDIT=1).
 func auditEnabled() bool {
-	v := os.Getenv("MINAI_AUDIT")
-	return v != "" && v != "0"
+	return env.Truthy(env.Audit)
 }
 
 // RunChild is the entry point of the sandboxed subprocess. It reads an
@@ -247,8 +239,8 @@ func runChild(log *slog.Logger) Result {
 	// os.Environ later in the same process (the child exits immediately
 	// after, so this is belt-and-suspenders).
 	if enve.DetectMode != "" {
-		os.Setenv(EnvDetectMode, enve.DetectMode)
-		defer os.Unsetenv(EnvDetectMode)
+		os.Setenv(env.DetectMode, enve.DetectMode)
+		defer os.Unsetenv(env.DetectMode)
 	}
 
 	output, err := tool.Handler(enve.Args)
