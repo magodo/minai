@@ -159,9 +159,13 @@ func (a *Agent) Turn(ctx context.Context, userInput string) error {
 	return fmt.Errorf("max ReAct steps (%d) exceeded", a.maxSteps)
 }
 
-// maxPermissionRetries caps how many times we'll prompt+retry a single tool
-// call as the user incrementally unlocks paths. Stops loops where a tool
-// keeps hitting new denied paths forever.
+// maxPermissionRetries caps how many times we'll re-run a single tool
+// call as the user incrementally unlocks paths. Each retry can prompt
+// for multiple distinct denials in one pass (the ptrace mode of
+// run_shell surfaces every EACCES path the command hit at once), so a
+// single attempt may resolve many denials; this cap exists only to
+// stop unbounded loops where the command keeps discovering new denied
+// paths forever.
 const maxPermissionRetries = 8
 
 func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
@@ -171,6 +175,16 @@ func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
 	}
 	fmt.Fprintf(a.out, "\n\x1b[2m→ %s(%s)\x1b[0m\n", tc.Function.Name, compactJSON(tc.Function.Arguments))
 	a.log.Info("tool call", "tool", tc.Function.Name, "args", compactJSON(tc.Function.Arguments))
+
+	// Per-dispatch memory of paths the user has explicitly declined
+	// to grant in this tool call. We never re-prompt for the same
+	// path twice within one dispatch: doing so would flood the user
+	// with the same question on every retry attempt (the underlying
+	// command will keep hitting that path until either we grant it
+	// or the command gives up). deniedOrder preserves first-deny
+	// ordering for the surfaced annotation.
+	deniedSet := map[string]bool{}
+	var deniedOrder []string
 
 	for attempt := 0; attempt < maxPermissionRetries; attempt++ {
 		ro, rw := a.access.snapshot()
@@ -196,36 +210,70 @@ func (a *Agent) dispatch(ctx context.Context, tc copilot.ToolCall) string {
 			return msg
 		}
 		a.log.Debug("sandbox result",
-			"denied_path", res.DeniedPath,
-			"denied_mode", res.DeniedMode,
+			"denials", res.Denials,
 			"err", res.Error,
 			"output_bytes", len(res.Output))
 
-		if res.DeniedPath != "" {
-			fmt.Fprintf(a.out, "\x1b[33m  sandbox blocked %s access to %s\x1b[0m\n",
-				res.DeniedMode, res.DeniedPath)
-			a.log.Info("access denied by sandbox",
-				"path", res.DeniedPath, "mode", res.DeniedMode, "attempt", attempt+1)
-			grantPath, mode := a.promptAccess(res.DeniedPath, res.DeniedMode)
-			if mode == "" {
-				deny := "error: user denied sandbox access to " + res.DeniedPath
-				a.log.Info("user denied", "path", res.DeniedPath)
-				fmt.Fprintf(a.out, "\x1b[2m← %s\x1b[0m\n", firstLine(deny))
-				return deny
+		// Partition the reported denials into ones the user hasn't
+		// seen yet vs ones they've already rejected in this dispatch.
+		var newDenials []sandbox.Denial
+		for _, d := range res.Denials {
+			if !deniedSet[d.Path] {
+				newDenials = append(newDenials, d)
 			}
-			a.log.Info("user granted",
-				"requested", res.DeniedPath, "grant_path", grantPath, "mode", mode)
-			a.access.allow(grantPath, mode)
-			continue
+		}
+
+		if len(newDenials) > 0 {
+			sawGrant := false
+			for _, d := range newDenials {
+				fmt.Fprintf(a.out, "\x1b[33m  sandbox blocked %s access to %s\x1b[0m\n",
+					d.Mode, d.Path)
+				a.log.Info("access denied by sandbox",
+					"path", d.Path, "mode", d.Mode, "attempt", attempt+1)
+				grantPath, mode := a.promptAccess(d.Path, d.Mode)
+				if mode == "" {
+					deniedSet[d.Path] = true
+					deniedOrder = append(deniedOrder, d.Path)
+					a.log.Info("user denied", "path", d.Path)
+					continue
+				}
+				a.log.Info("user granted",
+					"requested", d.Path, "grant_path", grantPath, "mode", mode)
+				a.access.allow(grantPath, mode)
+				sawGrant = true
+			}
+			if sawGrant {
+				// At least one new grant; re-run the tool. Paths
+				// the user rejected in this iteration are now in
+				// deniedSet, so we won't ask about them again,
+				// even though Landlock will keep blocking them
+				// and they will reappear in res.Denials.
+				continue
+			}
+			// Every new denial in this iteration was rejected;
+			// fall through and surface whatever the command
+			// produced under the current access state.
+		}
+
+		// Annotate the model-facing output with the cumulative list of
+		// paths the user explicitly denied in this dispatch, so the
+		// model can reason about why the command behaved the way it
+		// did (it would otherwise have no signal about user denials
+		// when the command is robust enough to exit cleanly despite
+		// the missing access).
+		var prefix string
+		if len(deniedOrder) > 0 {
+			prefix = fmt.Sprintf("[user denied sandbox access to: %s]\n",
+				strings.Join(deniedOrder, ", "))
 		}
 
 		if res.Error != "" {
-			msg := "error: " + res.Error
+			msg := prefix + "error: " + res.Error
 			a.log.Warn("tool returned error", "tool", tc.Function.Name, "err", res.Error)
 			fmt.Fprintf(a.out, "\x1b[2m← %s\x1b[0m\n", firstLine(msg))
 			return msg
 		}
-		out := res.Output
+		out := prefix + res.Output
 		const maxToolOut = 8000
 		if len(out) > maxToolOut {
 			out = out[:maxToolOut] + "\n...[truncated]"

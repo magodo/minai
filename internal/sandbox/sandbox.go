@@ -10,18 +10,22 @@
 // allow lists, then executes the tool handler and writes a JSON Result to
 // stdout.
 //
-// On EACCES the Result includes the offending path and the desired mode
-// ("ro"/"rw") so the parent can prompt the user and retry. Two detection
-// strategies are wired in:
+// On EACCES the Result includes a list of (path, mode) Denials so the
+// parent can prompt the user once per distinct path and retry. The list
+// often has a single entry, but ptrace-mode shell invocations can
+// surface every path the command failed to access in one batch, which
+// avoids the "one retry per denied path" loop when the command tolerates
+// some failures but not others. Two detection strategies are wired in:
 //
-//   - A Go-error route (`pathFromError`) that unwraps `*fs.PathError` from
-//     handlers that return an error containing one. This works for both
-//     direct Go syscall wrappers (read_file, write_file, ...) and for the
-//     run_shell tool when it runs under the "ptrace" detect mode and
-//     synthesizes a PathError from a ptrace-observed EACCES/EPERM syscall.
+//   - A Go-error route (`denialsFromError`) that walks err's tree for
+//     *fs.PathError values carrying a permission denial. This covers
+//     both direct Go syscall wrappers (read_file, write_file, ...) and
+//     the run_shell tool's "ptrace" mode, which returns one or more
+//     PathErrors aggregated in a *tools.MultiPathError.
 //   - A combined-output regex route (`pathFromText`) that matches typical
 //     coreutils / shell "Permission denied" lines. This is the fallback
-//     for run_shell in its default detect mode.
+//     for run_shell in its default detect mode and only ever produces a
+//     single denial.
 //
 // Landlock self-restriction is irrevocable for the calling process, which is
 // why every tool call uses a fresh subprocess.
@@ -31,7 +35,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -63,12 +66,25 @@ type Envelope struct {
 	DetectMode string          `json:"detect_mode,omitempty"`
 }
 
-// Result is what the child writes to its stdout.
+// Denial describes one sandbox access denial that the parent agent
+// must arbitrate before retrying the tool call. Mode is either "ro" or
+// "rw" and reports the most permissive intent the tool actually needs
+// on this path (so granting that mode is enough for the next retry to
+// succeed on this path; lesser modes may still be insufficient).
+type Denial struct {
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+}
+
+// Result is what the child writes to its stdout. Denials lists every
+// distinct path the tool was denied access to in this invocation, in
+// the order they were detected; a length-1 slice is the common case
+// (single PathError from a Go-native tool or single regex hit on
+// shell output), while ptrace mode for run_shell can produce many.
 type Result struct {
-	Output     string `json:"output"`
-	Error      string `json:"error"`
-	DeniedPath string `json:"denied_path,omitempty"`
-	DeniedMode string `json:"denied_mode,omitempty"` // "ro" or "rw"
+	Output  string   `json:"output"`
+	Error   string   `json:"error"`
+	Denials []Denial `json:"denials,omitempty"`
 }
 
 // BaselineRO is the set of system directories we always allow the sandboxed
@@ -248,20 +264,21 @@ func runChild(log *slog.Logger) Result {
 
 	if err != nil {
 		log.Debug("tool returned error", "tool", enve.Tool, "err", err.Error(), "output", output)
-		if path := pathFromError(err); path != "" {
-			mode := modeFromOp(err, defaultMode)
-			log.Info("EACCES detected via PathError",
-				"path", path, "mode", mode, "err", err)
+		if denials := denialsFromError(err, defaultMode); len(denials) > 0 {
+			for i := range denials {
+				denials[i].Path = canonical(denials[i].Path)
+			}
+			log.Info("EACCES detected via PathError(s)",
+				"denials", denials, "err", err)
 			// Output is kept too: the Go-native tools always return
 			// "" on error so this is a no-op for them, but the
 			// run_shell tool's ptrace-mode handler returns the
-			// command's combined output alongside a synthesized
-			// PathError and we don't want to drop it.
+			// command's combined output alongside synthesized
+			// PathError(s) and we don't want to drop it.
 			return Result{
-				Output:     output,
-				Error:      err.Error(),
-				DeniedPath: canonical(path),
-				DeniedMode: mode,
+				Output:  output,
+				Error:   err.Error(),
+				Denials: denials,
 			}
 		}
 		return Result{Error: err.Error()}
@@ -271,9 +288,8 @@ func runChild(log *slog.Logger) Result {
 		log.Info("EACCES detected via output(stdout+stderr) regex",
 			"path", path, "mode", defaultMode, "output", output)
 		return Result{
-			Output:     output,
-			DeniedPath: canonical(path),
-			DeniedMode: defaultMode,
+			Output:  output,
+			Denials: []Denial{{Path: canonical(path), Mode: defaultMode}},
 		}
 	}
 
@@ -281,25 +297,58 @@ func runChild(log *slog.Logger) Result {
 	return Result{Output: output}
 }
 
-// pathFromError searches err's tree for an fs.PathError carrying a permission
-// denial and returns the offending path.
-func pathFromError(err error) string {
-	if pe, ok := errors.AsType[*fs.PathError](err); ok && os.IsPermission(pe.Err) {
-		return pe.Path
+// denialsFromError walks err's error tree and returns one Denial per
+// distinct *fs.PathError carrying a permission denial, preserving the
+// order of first occurrence. The fallback mode is used when the
+// PathError's Op string doesn't match a known read- or write-class
+// syscall (rare in practice, since tool handlers all use the standard
+// Go syscall wrappers or the ptrace tool's "stat"/"write" markers).
+//
+// This subsumes the historical pathFromError + modeFromOp pair: the
+// single-denial case is just a length-1 slice, and the multi-denial
+// case (run_shell under ptrace) returns every observed path so the
+// agent can prompt for each one in a single pass.
+func denialsFromError(err error, fallback string) []Denial {
+	var out []Denial
+	seen := map[string]bool{}
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil {
+			return
+		}
+		if pe, ok := e.(*fs.PathError); ok {
+			if os.IsPermission(pe.Err) && !seen[pe.Path] {
+				seen[pe.Path] = true
+				out = append(out, Denial{
+					Path: pe.Path,
+					Mode: modeFromPathError(pe, fallback),
+				})
+			}
+			return
+		}
+		if u, ok := e.(interface{ Unwrap() []error }); ok {
+			for _, c := range u.Unwrap() {
+				walk(c)
+			}
+			return
+		}
+		if u, ok := e.(interface{ Unwrap() error }); ok {
+			walk(u.Unwrap())
+		}
 	}
-	return ""
+	walk(err)
+	return out
 }
 
-// modeFromOp inspects fs.PathError.Op to decide whether the access attempt
-// was read-only or read-write. Falls back to the caller-supplied default.
-func modeFromOp(err error, fallback string) string {
-	if pe, ok := errors.AsType[*fs.PathError](err); ok {
-		switch pe.Op {
-		case "stat", "lstat", "readdir", "readlink":
-			return "ro"
-		case "write", "mkdir", "create", "remove", "rename", "chmod", "chown", "truncate":
-			return "rw"
-		}
+// modeFromPathError classifies a single PathError's syscall as
+// requiring read-only or read-write access. Falls back to the
+// caller-supplied default for unknown Op strings.
+func modeFromPathError(pe *fs.PathError, fallback string) string {
+	switch pe.Op {
+	case "stat", "lstat", "readdir", "readlink":
+		return "ro"
+	case "write", "mkdir", "create", "remove", "rename", "chmod", "chown", "truncate":
+		return "rw"
 	}
 	return fallback
 }

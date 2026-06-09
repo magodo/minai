@@ -5,6 +5,7 @@ package sandbox_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ func TestMain(m *testing.M) {
 // structured denial. This exercises the full pipeline:
 //
 //	tools.runShell(ptrace) -> ptrace.Run -> synthesized *fs.PathError
-//	-> sandbox.pathFromError -> Result.DeniedPath / .DeniedMode
+//	-> sandbox.denialsFromError -> Result.Denials
 func TestExec_ShellPtrace_EACCES(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root; /etc/shadow would be readable")
@@ -54,21 +55,81 @@ func TestExec_ShellPtrace_EACCES(t *testing.T) {
 		t.Fatalf("sandbox.Exec: %v", err)
 	}
 	t.Logf("result: %+v", *res)
-	if res.DeniedPath == "" {
-		t.Fatalf("expected DeniedPath; got %+v", *res)
+	if len(res.Denials) == 0 {
+		t.Fatalf("expected at least one Denial; got %+v", *res)
 	}
 	want := filepath.Clean("/etc/shadow")
-	if res.DeniedPath != want {
-		t.Errorf("DeniedPath = %q, want %q", res.DeniedPath, want)
+	if res.Denials[0].Path != want {
+		t.Errorf("Denials[0].Path = %q, want %q", res.Denials[0].Path, want)
 	}
-	if res.DeniedMode != "ro" {
-		t.Errorf("DeniedMode = %q, want %q", res.DeniedMode, "ro")
+	if res.Denials[0].Mode != "ro" {
+		t.Errorf("Denials[0].Mode = %q, want %q", res.Denials[0].Mode, "ro")
+	}
+}
+
+// TestExec_ShellPtrace_MultipleDenials covers the new behavior where a
+// single ptrace-traced command can surface multiple distinct denied
+// paths in one Result. We create two unreadable files under a temp dir,
+// pre-grant the dir via AllowedRO so Landlock doesn't deny first, then
+// run a shell command that touches both files. The POSIX layer rejects
+// each open() with EACCES and both paths should show up in res.Denials.
+func TestExec_ShellPtrace_MultipleDenials(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; chmod 0000 has no effect")
+	}
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.txt")
+	b := filepath.Join(dir, "b.txt")
+	for _, p := range []string{a, b} {
+		if err := os.WriteFile(p, []byte("x"), 0o000); err != nil {
+			t.Fatalf("create %s: %v", p, err)
+		}
+		// Re-chmod in case umask/fs masked the perms above.
+		if err := os.Chmod(p, 0o000); err != nil {
+			t.Fatalf("chmod %s: %v", p, err)
+		}
+	}
+	args, err := json.Marshal(struct {
+		Command string `json:"command"`
+	}{Command: fmt.Sprintf("cat %s 2>&1; cat %s 2>&1; echo done", a, b)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := sandbox.Envelope{
+		Tool:       "run_shell",
+		Args:       args,
+		DetectMode: "ptrace",
+		AllowedRO:  []string{dir},
+	}
+	res, err := sandbox.Exec(context.Background(), env, nil)
+	if err != nil {
+		t.Fatalf("sandbox.Exec: %v", err)
+	}
+	t.Logf("result: %+v", *res)
+	if len(res.Denials) < 2 {
+		t.Fatalf("expected at least 2 Denials (one per file); got %d: %+v",
+			len(res.Denials), res.Denials)
+	}
+	seen := map[string]bool{}
+	for _, d := range res.Denials {
+		seen[d.Path] = true
+		if d.Mode != "ro" {
+			t.Errorf("Denial for %s: Mode = %q, want %q", d.Path, d.Mode, "ro")
+		}
+	}
+	if !seen[filepath.Clean(a)] {
+		t.Errorf("expected a Denial for %s; got %+v", a, res.Denials)
+	}
+	if !seen[filepath.Clean(b)] {
+		t.Errorf("expected a Denial for %s; got %+v", b, res.Denials)
 	}
 }
 
 // TestExec_ShellDefault_EACCES is the equivalent check for the default
 // regex-based detection: it should also surface the path, just via the
-// `pathFromText` route instead of the synthesized PathError.
+// `pathFromText` route instead of the synthesized PathError. The
+// default mode only ever produces a single denial regardless of how
+// many "Permission denied" lines appear in the output.
 func TestExec_ShellDefault_EACCES(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root; /etc/shadow would be readable")
@@ -89,11 +150,11 @@ func TestExec_ShellDefault_EACCES(t *testing.T) {
 		t.Fatalf("sandbox.Exec: %v", err)
 	}
 	t.Logf("result: %+v", *res)
-	if res.DeniedPath == "" {
-		t.Fatalf("expected DeniedPath; got %+v", *res)
+	if len(res.Denials) == 0 {
+		t.Fatalf("expected at least one Denial; got %+v", *res)
 	}
-	if !strings.Contains(res.DeniedPath, "shadow") {
-		t.Errorf("DeniedPath = %q, want it to contain 'shadow'", res.DeniedPath)
+	if !strings.Contains(res.Denials[0].Path, "shadow") {
+		t.Errorf("Denials[0].Path = %q, want it to contain 'shadow'", res.Denials[0].Path)
 	}
 }
 
@@ -118,8 +179,8 @@ func TestExec_ShellPtrace_ENOENT_NotReported(t *testing.T) {
 		t.Fatalf("sandbox.Exec: %v", err)
 	}
 	t.Logf("result: %+v", *res)
-	if res.DeniedPath != "" {
-		t.Errorf("expected DeniedPath to be empty for an ENOENT-only command; got %q", res.DeniedPath)
+	if len(res.Denials) != 0 {
+		t.Errorf("expected no Denials for an ENOENT-only command; got %+v", res.Denials)
 	}
 	if !strings.Contains(res.Output, "ok") {
 		t.Errorf("expected output to contain 'ok'; got %q", res.Output)

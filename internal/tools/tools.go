@@ -203,13 +203,55 @@ func runShellDefault(command string) (string, error) {
 	return res, nil
 }
 
+// MultiPathError aggregates one or more *fs.PathError values produced
+// during a single tool invocation. The run_shell tool emits it in ptrace
+// mode when the command (or any of its descendants) triggers multiple
+// distinct EACCES/EPERM filesystem syscalls, so the sandbox layer can
+// prompt the user for every denied path in a single pass instead of
+// forcing the "fix one path per retry" loop. The Errs slice preserves
+// first-seen order and is deduplicated by path; if the same path was
+// hit by both a read- and a write-intent syscall the write-intent
+// variant wins, so the user is prompted for the most permissive grant
+// the command actually needs.
+type MultiPathError struct {
+	Errs []*fs.PathError
+}
+
+// Error returns a compact, human-readable summary suitable for logging
+// and for the "error: ..." string the sandbox propagates back to the
+// model when every denial in this batch is ultimately rejected.
+func (m *MultiPathError) Error() string {
+	switch len(m.Errs) {
+	case 0:
+		return "(no path errors)"
+	case 1:
+		return m.Errs[0].Error()
+	}
+	paths := make([]string, len(m.Errs))
+	for i, e := range m.Errs {
+		paths[i] = e.Path
+	}
+	return fmt.Sprintf("permission denied on %d paths: %s",
+		len(m.Errs), strings.Join(paths, ", "))
+}
+
+// Unwrap exposes the constituent errors so callers that traverse error
+// trees (errors.Is/As, custom walkers) can reach the individual
+// *fs.PathError values.
+func (m *MultiPathError) Unwrap() []error {
+	out := make([]error, len(m.Errs))
+	for i, e := range m.Errs {
+		out[i] = e
+	}
+	return out
+}
+
 // runShellPtrace runs the shell command under ptrace so that every failed
 // filesystem syscall the command (or any descendant) makes is captured at
-// the source. When at least one EACCES/EPERM failure is observed, we
-// synthesize an *fs.PathError pointing at the first such path and return
-// it as the handler's error: the sandbox child's existing detection path
-// (`pathFromError` + `modeFromOp`) then surfaces it to the agent as a
-// structured denial, identical to the way the Go-native tools do.
+// the source. EACCES/EPERM failures are deduplicated by path (read+write
+// on the same path collapse to a single write-intent denial) and the full
+// set is returned as a *MultiPathError so the sandbox layer can prompt
+// the user for each denied path in one pass.
 //
 // Other failed FS syscalls (ENOENT for PATH probing, missing locale
 // catalogs, etc.) are intentionally ignored to stay semantically aligned
@@ -239,9 +281,20 @@ func runShellPtrace(command string) (string, error) {
 		output += "\n[exit error: " + waitStatusString(res.WaitStatus) + "]"
 	}
 
-	// Find the first EACCES/EPERM failure with a non-empty path and
-	// synthesize a PathError so the sandbox's existing detection path
-	// can pick it up.
+	// Walk every recorded failure and accumulate one PathError per
+	// distinct path. A single command typically hits the same path
+	// through several syscalls (e.g. an access(R_OK) probe followed
+	// by an openat()), and we don't want to bother the user multiple
+	// times for the same target. If different syscalls on the same
+	// path disagree on intent we keep the most permissive one (write)
+	// so the eventual user grant covers every observed need.
+	//
+	// Op strings are mapped so sandbox.modeFromPathError classifies
+	// them correctly:
+	//   - IntentRead  -> "stat"  -> "ro"
+	//   - IntentWrite -> "write" -> "rw"
+	indexByPath := map[string]int{}
+	var errs []*fs.PathError
 	for _, f := range res.Failures {
 		if f.Errno != syscall.EACCES && f.Errno != syscall.EPERM {
 			continue
@@ -250,21 +303,27 @@ func runShellPtrace(command string) (string, error) {
 		if path == "" {
 			continue
 		}
-		// Map the ptrace syscall name to a PathError.Op string that
-		// sandbox.modeFromOp already classifies correctly:
-		//   - IntentRead -> "stat" -> "ro"
-		//   - IntentWrite -> "write" -> "rw"
 		op := "stat"
 		if ptrace.IntentOf(f.Syscall) == ptrace.IntentWrite {
 			op = "write"
 		}
-		return output, &fs.PathError{
-			Op:   op,
-			Path: path,
-			Err:  f.Errno,
+		if i, ok := indexByPath[path]; ok {
+			// Upgrade ro -> rw if any later occurrence on the same
+			// path needs write access. Never downgrade.
+			if op == "write" && errs[i].Op != "write" {
+				errs[i].Op = "write"
+				errs[i].Err = f.Errno
+			}
+			continue
 		}
+		indexByPath[path] = len(errs)
+		errs = append(errs, &fs.PathError{Op: op, Path: path, Err: f.Errno})
 	}
-	return output, nil
+
+	if len(errs) == 0 {
+		return output, nil
+	}
+	return output, &MultiPathError{Errs: errs}
 }
 
 // waitStatusString renders a syscall.WaitStatus the same way
